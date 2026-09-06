@@ -142,7 +142,6 @@ struct cached_dirents {
 
 struct cached_fid {
 	struct rb_node node;
-	struct hlist_node dentry_node;
 	struct list_head dying_entry;
 	struct cached_fids *cfids;
 	const char *path;
@@ -187,7 +186,6 @@ struct cached_fids {
 	spinlock_t cfid_list_lock;
 	int num_entries;
 	struct rb_root entries;
-	struct hlist_head *dentry_ht;
 	struct list_head dying;
 	struct delayed_work laundromat_work;
 	/* aggregate accounting for all cached dirents under this tcon */

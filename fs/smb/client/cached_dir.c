@@ -22,7 +22,6 @@ static void smb2_close_cached_fid(struct kref *ref);
 static void cfids_laundromat_worker(struct work_struct *work);
 
 #define CACHED_DIRENT_HASH_BITS	7
-#define CACHED_DIR_DENTRY_HT_BITS	8
 #define CACHED_DIR_POPULATE_TIMEOUT	10
 
 struct cached_dir_dentry {
@@ -1290,18 +1289,98 @@ static struct cached_fid *cfid_rb_find(struct rb_root *root, const char *path)
 	return NULL;
 }
 
-static struct cached_fid *cfid_dentry_ht_find(struct cached_fids *cfids,
-					      struct dentry *dentry)
+/*
+ * Cached directory handles are looked up by dentry on every stat (see
+ * cifs_dentry_needs_reval()) and once more whenever a child directory is
+ * cached.  Rather than search a per-tcon structure for that, publish the
+ * handle on the directory inode itself, so a lookup costs one dereference.
+ *
+ * The back-pointer lives in cifsInodeInfo and is read and written under the
+ * directory inode's i_lock, which nests inside cfid_list_lock and cfid_lock.
+ * @cfid_owner records the owning cached_fids: on a multiuser mount several
+ * tcons share one superblock, and a lookup must never dereference a handle
+ * that belongs to another tcon.
+ *
+ * A published handle holds a reference on its dentry, and so on the inode,
+ * so d_inode() stays valid for as long as the handle is published and the
+ * slot cannot outlive the inode holding it.  Clearing is a compare-and-clear
+ * against the handle itself, so a handle being torn down cannot clear a
+ * pointer that a newer handle for the same directory has already installed.
+ */
+static void cached_dir_publish_locked(struct cached_fid *cfid)
 {
-	struct cached_fid *cfid;
+	struct inode *inode;
 
-	hlist_for_each_entry(cfid,
-			     &cfids->dentry_ht[hash_ptr(dentry, CACHED_DIR_DENTRY_HT_BITS)],
-			     dentry_node) {
-		if (cfid->dentry == dentry)
-			return cfid;
+	lockdep_assert_held(&cfid->cfids->cfid_list_lock);
+
+	if (!cfid->dentry || d_really_is_negative(cfid->dentry))
+		return;
+	inode = d_inode(cfid->dentry);
+	spin_lock(&inode->i_lock);
+	CIFS_I(inode)->cfid = cfid;
+	CIFS_I(inode)->cfid_owner = cfid->cfids;
+	spin_unlock(&inode->i_lock);
+}
+
+/*
+ * Detach @cfid from its directory inode.  Must run before the handle's dentry
+ * reference is dropped, while that reference still pins the inode.
+ */
+static void cached_dir_unpublish_locked(struct cached_fid *cfid)
+{
+	struct inode *inode;
+
+	lockdep_assert_held(&cfid->cfids->cfid_list_lock);
+
+	if (!cfid->dentry)
+		return;
+	if (WARN_ON_ONCE(d_really_is_negative(cfid->dentry)))
+		return;
+	inode = d_inode(cfid->dentry);
+	spin_lock(&inode->i_lock);
+	if (CIFS_I(inode)->cfid == cfid) {
+		CIFS_I(inode)->cfid = NULL;
+		CIFS_I(inode)->cfid_owner = NULL;
 	}
-	return NULL;
+	spin_unlock(&inode->i_lock);
+}
+
+static void cached_dir_unpublish(struct cached_fid *cfid)
+{
+	struct cached_fids *cfids = cfid->cfids;
+
+	if (!cfids)
+		return;
+	spin_lock(&cfids->cfid_list_lock);
+	cached_dir_unpublish_locked(cfid);
+	spin_unlock(&cfids->cfid_list_lock);
+}
+
+/*
+ * Return the handle @cfids published for @dentry, or NULL.  The caller must
+ * hold cfid_list_lock: that is what keeps the returned handle alive, because
+ * every teardown path clears the back-pointer under the very same lock.
+ */
+static struct cached_fid *cached_dir_lookup_locked(struct cached_fids *cfids,
+						   struct dentry *dentry)
+{
+	struct cached_fid *cfid = NULL;
+	struct inode *inode;
+
+	lockdep_assert_held(&cfids->cfid_list_lock);
+
+	if (!dentry || d_really_is_negative(dentry))
+		return NULL;
+	inode = d_inode(dentry);
+	spin_lock(&inode->i_lock);
+	if (CIFS_I(inode)->cfid_owner == cfids)
+		cfid = CIFS_I(inode)->cfid;
+	spin_unlock(&inode->i_lock);
+
+	/* A directory inode can have more than one alias; match the exact one. */
+	if (cfid && cfid->dentry != dentry)
+		cfid = NULL;
+	return cfid;
 }
 
 static void cfid_rb_insert(struct rb_root *root, struct cached_fid *new)
@@ -1541,12 +1620,9 @@ replay_again:
 			struct cached_fid *parent_cfid;
 
 			spin_lock(&cfids->cfid_list_lock);
-			hlist_for_each_entry(parent_cfid,
-					     &cfids->dentry_ht[hash_ptr(dentry->d_parent,
-								CACHED_DIR_DENTRY_HT_BITS)],
-					     dentry_node) {
-				if (parent_cfid->dentry != dentry->d_parent)
-					continue;
+			parent_cfid = cached_dir_lookup_locked(cfids,
+							       dentry->d_parent);
+			if (parent_cfid) {
 				spin_lock(&parent_cfid->cfid_lock);
 				cifs_dbg(FYI, "found a parent cached file handle\n");
 				if (is_valid_cached_dir(parent_cfid)) {
@@ -1557,14 +1633,19 @@ replay_again:
 					       SMB2_LEASE_KEY_SIZE);
 				}
 				spin_unlock(&parent_cfid->cfid_lock);
-				break;
 			}
 			spin_unlock(&cfids->cfid_list_lock);
 		}
 	}
+	/*
+	 * Take cfid_list_lock for the publish: a lease break, a laundromat
+	 * pass or a reconnect may already be tearing this handle down, and
+	 * every teardown path clears the back-pointer under the same lock.
+	 */
+	spin_lock(&cfids->cfid_list_lock);
 	cfid->dentry = dentry;
-	hlist_add_head(&cfid->dentry_node,
-		       &cfids->dentry_ht[hash_ptr(dentry, CACHED_DIR_DENTRY_HT_BITS)]);
+	cached_dir_publish_locked(cfid);
+	spin_unlock(&cfids->cfid_list_lock);
 	cfid->tcon = tcon;
 
 	/*
@@ -1716,9 +1797,13 @@ out:
 		bool drop_lease_ref = false;
 
 		spin_lock(&cfids->cfid_list_lock);
+		/*
+		 * Unpublish unconditionally: a concurrent reconnect or lease
+		 * break may have taken this handle off the tree before it was
+		 * published, and it must not stay reachable either way.
+		 */
+		cached_dir_unpublish_locked(cfid);
 		if (cfid->on_list) {
-			if (cfid->dentry)
-				hlist_del_init(&cfid->dentry_node);
 			rb_erase(&cfid->node, &cfids->entries);
 			cfid->on_list = false;
 			cfids->num_entries--;
@@ -1763,7 +1848,7 @@ int open_cached_dir_by_dentry(struct cifs_tcon *tcon,
 		return -ENOENT;
 
 	spin_lock(&cfids->cfid_list_lock);
-	cfid = cfid_dentry_ht_find(cfids, dentry);
+	cfid = cached_dir_lookup_locked(cfids, dentry);
 	if (cfid) {
 		spin_lock(&cfid->cfid_lock);
 		if (!is_valid_cached_dir(cfid)) {
@@ -1805,9 +1890,8 @@ __releases(&cfid->cfids->cfid_list_lock)
 
 	lockdep_assert_held(&cfid->cfids->cfid_list_lock);
 
+	cached_dir_unpublish_locked(cfid);
 	if (cfid->on_list) {
-		if (cfid->dentry)
-			hlist_del_init(&cfid->dentry_node);
 		rb_erase(&cfid->node, &cfid->cfids->entries);
 		cfid->on_list = false;
 		cfid->cfids->num_entries--;
@@ -1917,9 +2001,9 @@ void close_all_cached_dirs(struct cifs_sb_info *cifs_sb)
 				goto done;
 			}
 
+			cached_dir_unpublish_locked(cfid);
 			spin_lock(&cfid->cfid_lock);
 			tmp_list->dentry = cfid->dentry;
-			hlist_del_init(&cfid->dentry_node);
 			cfid->dentry = NULL;
 			spin_unlock(&cfid->cfid_lock);
 
@@ -1963,8 +2047,7 @@ void invalidate_all_cached_dirs(struct cifs_tcon *tcon, bool sync)
 	     rb_node; rb_node = next_node) {
 		next_node = rb_next(rb_node);
 		cfid = rb_entry(rb_node, struct cached_fid, node);
-		if (cfid->dentry)
-			hlist_del_init(&cfid->dentry_node);
+		cached_dir_unpublish_locked(cfid);
 		rb_erase(rb_node, &cfids->entries);
 		list_add(&cfid->dying_entry, &cfids->dying);
 		cfids->num_entries--;
@@ -2015,6 +2098,7 @@ static void cached_dir_put_work(struct work_struct *work)
 {
 	struct cached_fid *cfid = container_of(work, struct cached_fid,
 					       put_work);
+	cached_dir_unpublish(cfid);
 	dput(cfid->dentry);
 	cfid->dentry = NULL;
 
@@ -2045,8 +2129,7 @@ bool cached_dir_lease_break(struct cifs_tcon *tcon, __u8 lease_key[16])
 			 * We found a lease remove it from the list
 			 * so no threads can access it.
 			 */
-			if (cfid->dentry)
-				hlist_del_init(&cfid->dentry_node);
+			cached_dir_unpublish_locked(cfid);
 			rb_erase(rb_node, &cfids->entries);
 			cfid->on_list = false;
 			cfids->num_entries--;
@@ -2080,7 +2163,6 @@ static struct cached_fid *init_cached_dir(const char *path)
 	INIT_WORK(&cfid->close_work, cached_dir_offload_close);
 	INIT_WORK(&cfid->put_work, cached_dir_put_work);
 	RB_CLEAR_NODE(&cfid->node);
-	INIT_HLIST_NODE(&cfid->dentry_node);
 	INIT_LIST_HEAD(&cfid->dying_entry);
 	INIT_LIST_HEAD(&cfid->dirents.entry_list);
 	mutex_init(&cfid->dirents.de_mutex);
@@ -2099,7 +2181,7 @@ static void free_cached_dir(struct cached_fid *cfid)
 	WARN_ON(work_pending(&cfid->put_work));
 	trace_smb3_free_cached_dir(cfid, cfid->path, strlen(cfid->path), 0);
 
-
+	cached_dir_unpublish(cfid);
 	dput(cfid->dentry);
 	cfid->dentry = NULL;
 
@@ -2151,8 +2233,7 @@ static void cfids_laundromat_worker(struct work_struct *work)
 		if (dir_cache_timeout && cfid->last_access_time &&
 		    time_after(jiffies, cfid->last_access_time + HZ * dir_cache_timeout)) {
 			cfid->on_list = false;
-			if (cfid->dentry)
-				hlist_del_init(&cfid->dentry_node);
+			cached_dir_unpublish_locked(cfid);
 			rb_erase(rb_node, &cfids->entries);
 			list_add(&cfid->dying_entry, &entry);
 			cfids->num_entries--;
@@ -2194,6 +2275,7 @@ static void cfids_laundromat_worker(struct work_struct *work)
 	list_for_each_entry_safe(cfid, q, &entry, dying_entry) {
 		list_del(&cfid->dying_entry);
 
+		cached_dir_unpublish(cfid);
 		dput(cfid->dentry);
 		cfid->dentry = NULL;
 
@@ -2224,12 +2306,6 @@ struct cached_fids *init_cached_dirs(void)
 		return NULL;
 	spin_lock_init(&cfids->cfid_list_lock);
 	cfids->entries = RB_ROOT;
-	cfids->dentry_ht = kcalloc(1 << CACHED_DIR_DENTRY_HT_BITS,
-				   sizeof(*cfids->dentry_ht), GFP_KERNEL);
-	if (!cfids->dentry_ht) {
-		kfree(cfids);
-		return NULL;
-	}
 	INIT_LIST_HEAD(&cfids->dying);
 
 	INIT_DELAYED_WORK(&cfids->laundromat_work, cfids_laundromat_worker);
@@ -2256,17 +2332,13 @@ void free_cached_dirs(struct cached_fids *cfids)
 
 	cancel_delayed_work_sync(&cfids->laundromat_work);
 
-	kfree(cfids->dentry_ht);
-	cfids->dentry_ht = NULL;
-
 	spin_lock(&cfids->cfid_list_lock);
 	for (struct rb_node *rb_node = rb_first(&cfids->entries), *next_node;
 	     rb_node; rb_node = next_node) {
 		next_node = rb_next(rb_node);
 		cfid = rb_entry(rb_node, struct cached_fid, node);
 		cfid->on_list = false;
-		if (cfid->dentry)
-			hlist_del_init(&cfid->dentry_node);
+		cached_dir_unpublish_locked(cfid);
 		spin_lock(&cfid->cfid_lock);
 		cfid->is_open = false;
 		spin_unlock(&cfid->cfid_lock);

@@ -308,6 +308,7 @@ struct cifsInodeInfo;
 struct cifs_open_parms;
 struct cifs_credits;
 struct cached_fid;
+struct cached_fids;
 
 struct smb_version_operations {
 	int (*send_cancel)(struct cifs_ses *ses, struct TCP_Server_Info *server,
@@ -1594,6 +1595,17 @@ struct cifsInodeInfo {
 	__u8 lease_key[SMB2_LEASE_KEY_SIZE];	/* lease key for this inode */
 	struct list_head deferred_closes; /* list of deferred closes */
 	spinlock_t deferred_lock; /* protection on deferred list */
+	/*
+	 * Cached directory handle published for this directory, plus the
+	 * cached_fids it belongs to.  Lets a lookup by dentry cost one
+	 * dereference instead of a search over every cached directory on the
+	 * tcon.  Both fields are read and written under this inode's i_lock;
+	 * @cfid_owner identifies the owning tcon, so a multiuser mount never
+	 * dereferences another tcon's handle.  A published handle holds a
+	 * reference on its dentry, and so on this inode.
+	 */
+	struct cached_fid *cfid;
+	struct cached_fids *cfid_owner;
 	bool lease_granted; /* Flag to indicate whether lease or oplock is granted. */
 	char *symlink_target;
 	__u32 reparse_tag;
