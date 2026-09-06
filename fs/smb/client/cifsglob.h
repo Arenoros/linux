@@ -1546,6 +1546,8 @@ enum cifs_inode_flags {
 	CIFS_INO_CLOSE_ON_LOCK,			/* Not to defer the close when lock is set */
 };
 
+struct cached_fid;
+
 struct cifsInodeInfo {
 	struct netfs_inode netfs; /* Netfslib context and vfs inode */
 	bool can_cache_brlcks;
@@ -1575,6 +1577,12 @@ struct cifsInodeInfo {
 	bool lease_granted; /* Flag to indicate whether lease or oplock is granted. */
 	char *symlink_target;
 	__u32 reparse_tag;
+	/*
+	 * Cached directory handle published for this directory, so that lookups
+	 * by dentry do not walk cfids->entries. Read and written only under
+	 * cfids->cfid_list_lock; the cfid pins the dentry while it is set.
+	 */
+	struct cached_fid *cfid;
 };
 
 static inline struct cifsInodeInfo *

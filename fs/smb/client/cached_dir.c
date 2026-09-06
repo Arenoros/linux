@@ -18,6 +18,64 @@ static void smb2_close_cached_fid(struct kref *ref);
 static void cfids_laundromat_worker(struct work_struct *work);
 static void close_cached_dir_locked(struct cached_fid *cfid);
 
+/*
+ * Cached directory handles are looked up by dentry on every stat (see
+ * cifs_dentry_needs_reval()) and once more when a child directory is cached.
+ * Walking cfids->entries for that makes every operation O(max_cached_dirs),
+ * which defeats the point of raising max_cached_dirs to cover a large tree.
+ * Publish the handle on the directory inode instead. The back-pointer is only
+ * read or written under cfids->cfid_list_lock, and the cfid holds a reference
+ * on the dentry - and so on the inode - for as long as it is published.
+ */
+static struct cached_fid *cached_dir_lookup_locked(struct cached_fids *cfids,
+						   struct dentry *dentry)
+{
+	struct cached_fid *cfid;
+
+	lockdep_assert_held(&cfids->cfid_list_lock);
+
+	if (!dentry || d_really_is_negative(dentry))
+		return NULL;
+	cfid = CIFS_I(d_inode(dentry))->cfid;
+	if (!cfid || cfid->dentry != dentry || cfid->cfids != cfids)
+		return NULL;
+	return cfid;
+}
+
+static void cached_dir_publish(struct cached_fid *cfid)
+{
+	struct cached_fids *cfids = cfid->cfids;
+
+	if (!cfid->dentry || d_really_is_negative(cfid->dentry))
+		return;
+	spin_lock(&cfids->cfid_list_lock);
+	CIFS_I(d_inode(cfid->dentry))->cfid = cfid;
+	spin_unlock(&cfids->cfid_list_lock);
+}
+
+/* Must be called before cfid->dentry is dropped, with cfid_list_lock held. */
+static void cached_dir_unpublish_locked(struct cached_fid *cfid)
+{
+	struct cifsInodeInfo *cinode;
+
+	lockdep_assert_held(&cfid->cfids->cfid_list_lock);
+
+	if (!cfid->dentry || d_really_is_negative(cfid->dentry))
+		return;
+	cinode = CIFS_I(d_inode(cfid->dentry));
+	if (cinode->cfid == cfid)
+		cinode->cfid = NULL;
+}
+
+static void cached_dir_unpublish(struct cached_fid *cfid)
+{
+	struct cached_fids *cfids = cfid->cfids;
+
+	spin_lock(&cfids->cfid_list_lock);
+	cached_dir_unpublish_locked(cfid);
+	spin_unlock(&cfids->cfid_list_lock);
+}
+
 struct cached_dir_dentry {
 	struct list_head entry;
 	struct dentry *dentry;
@@ -230,17 +288,15 @@ replay_again:
 			struct cached_fid *parent_cfid;
 
 			spin_lock(&cfids->cfid_list_lock);
-			list_for_each_entry(parent_cfid, &cfids->entries, entry) {
-				if (parent_cfid->dentry == dentry->d_parent) {
-					cifs_dbg(FYI, "found a parent cached file handle\n");
-					if (is_valid_cached_dir(parent_cfid)) {
-						lease_flags
-							|= SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET_LE;
-						memcpy(pfid->parent_lease_key,
-						       parent_cfid->fid.lease_key,
-						       SMB2_LEASE_KEY_SIZE);
-					}
-					break;
+			parent_cfid = cached_dir_lookup_locked(cfids, dentry->d_parent);
+			if (parent_cfid) {
+				cifs_dbg(FYI, "found a parent cached file handle\n");
+				if (is_valid_cached_dir(parent_cfid)) {
+					lease_flags |=
+						SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET_LE;
+					memcpy(pfid->parent_lease_key,
+					       parent_cfid->fid.lease_key,
+					       SMB2_LEASE_KEY_SIZE);
 				}
 			}
 			spin_unlock(&cfids->cfid_list_lock);
@@ -248,6 +304,7 @@ replay_again:
 	}
 	cfid->dentry = dentry;
 	cfid->tcon = tcon;
+	cached_dir_publish(cfid);
 
 	/*
 	 * We do not hold the lock for the open because in case
@@ -433,17 +490,14 @@ int open_cached_dir_by_dentry(struct cifs_tcon *tcon,
 		return -ENOENT;
 
 	spin_lock(&cfids->cfid_list_lock);
-	list_for_each_entry(cfid, &cfids->entries, entry) {
-		if (cfid->dentry == dentry) {
-			if (!is_valid_cached_dir(cfid))
-				break;
-			cifs_dbg(FYI, "found a cached file handle by dentry\n");
-			kref_get(&cfid->refcount);
-			*ret_cfid = cfid;
-			cfid->last_access_time = jiffies;
-			spin_unlock(&cfids->cfid_list_lock);
-			return 0;
-		}
+	cfid = cached_dir_lookup_locked(cfids, dentry);
+	if (cfid && is_valid_cached_dir(cfid)) {
+		cifs_dbg(FYI, "found a cached file handle by dentry\n");
+		kref_get(&cfid->refcount);
+		*ret_cfid = cfid;
+		cfid->last_access_time = jiffies;
+		spin_unlock(&cfids->cfid_list_lock);
+		return 0;
 	}
 	spin_unlock(&cfids->cfid_list_lock);
 	return -ENOENT;
@@ -464,6 +518,7 @@ __releases(&cfid->cfids->cfid_list_lock)
 		cfid->on_list = false;
 		cfid->cfids->num_entries--;
 	}
+	cached_dir_unpublish_locked(cfid);
 	spin_unlock(&cfid->cfids->cfid_list_lock);
 
 	dput(cfid->dentry);
@@ -577,6 +632,7 @@ void close_all_cached_dirs(struct cifs_sb_info *cifs_sb)
 				goto done;
 			}
 
+			cached_dir_unpublish_locked(cfid);
 			tmp_list->dentry = cfid->dentry;
 			cfid->dentry = NULL;
 
@@ -661,6 +717,7 @@ static void cached_dir_put_work(struct work_struct *work)
 {
 	struct cached_fid *cfid = container_of(work, struct cached_fid,
 					       put_work);
+	cached_dir_unpublish(cfid);
 	dput(cfid->dentry);
 	cfid->dentry = NULL;
 
@@ -732,6 +789,9 @@ static void free_cached_dir(struct cached_fid *cfid)
 	WARN_ON(work_pending(&cfid->close_work));
 	WARN_ON(work_pending(&cfid->put_work));
 
+	/* Only still set when reached via free_cached_dirs() at unmount. */
+	if (cfid->dentry)
+		cached_dir_unpublish(cfid);
 	dput(cfid->dentry);
 	cfid->dentry = NULL;
 
@@ -797,6 +857,7 @@ static void cfids_laundromat_worker(struct work_struct *work)
 	list_for_each_entry_safe(cfid, q, &entry, entry) {
 		list_del(&cfid->entry);
 
+		cached_dir_unpublish(cfid);
 		dput(cfid->dentry);
 		cfid->dentry = NULL;
 

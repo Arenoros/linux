@@ -459,6 +459,7 @@ cifs_alloc_inode(struct super_block *sb)
 	spin_lock_init(&cifs_inode->open_file_lock);
 	generate_random_uuid(cifs_inode->lease_key);
 	cifs_inode->symlink_target = NULL;
+	cifs_inode->cfid = NULL;
 
 	/*
 	 * Can not set i_flags here - they get immediately overwritten to zero
