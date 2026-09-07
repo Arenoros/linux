@@ -1562,9 +1562,11 @@ replay_again:
 			spin_unlock(&cfids->cfid_list_lock);
 		}
 	}
+	spin_lock(&cfids->cfid_list_lock);
 	cfid->dentry = dentry;
 	hlist_add_head(&cfid->dentry_node,
 		       &cfids->dentry_ht[hash_ptr(dentry, CACHED_DIR_DENTRY_HT_BITS)]);
+	spin_unlock(&cfids->cfid_list_lock);
 	cfid->tcon = tcon;
 
 	/*
@@ -1716,9 +1718,8 @@ out:
 		bool drop_lease_ref = false;
 
 		spin_lock(&cfids->cfid_list_lock);
+		hlist_del_init(&cfid->dentry_node);
 		if (cfid->on_list) {
-			if (cfid->dentry)
-				hlist_del_init(&cfid->dentry_node);
 			rb_erase(&cfid->node, &cfids->entries);
 			cfid->on_list = false;
 			cfids->num_entries--;
@@ -1805,9 +1806,8 @@ __releases(&cfid->cfids->cfid_list_lock)
 
 	lockdep_assert_held(&cfid->cfids->cfid_list_lock);
 
+	hlist_del_init(&cfid->dentry_node);
 	if (cfid->on_list) {
-		if (cfid->dentry)
-			hlist_del_init(&cfid->dentry_node);
 		rb_erase(&cfid->node, &cfid->cfids->entries);
 		cfid->on_list = false;
 		cfid->cfids->num_entries--;
