@@ -5647,7 +5647,6 @@ SMB2_query_directory_large(struct cifs_query_dir_io *qd_io, unsigned int buf_siz
 				 .rq_nvec = SMB2_QUERY_DIRECTORY_IOV_SIZE };
 	struct TCP_Server_Info *server = qd_io->server;
 	struct cifs_tcon *tcon = qd_io->tcon;
-	unsigned int total_len;
 	int credit_request;
 
 	cifs_dbg(FYI, "%s: buf_size=%u\n", __func__, buf_size);
@@ -5693,8 +5692,6 @@ SMB2_query_directory_large(struct cifs_query_dir_io *qd_io, unsigned int buf_siz
 		flags |= CIFS_TRANSFORM_REQ;
 
 	buf = rqst.rq_iov[0].iov_base;
-	total_len = rqst.rq_iov[0].iov_len;
-
 	shdr = (struct smb2_hdr *)buf;
 
 	if (qd_io->replay) {
